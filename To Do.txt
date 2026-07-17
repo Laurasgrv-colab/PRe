@@ -1,0 +1,11 @@
+To Do
+
+-> leer soul_mh de Gemini
+->añadir otras modif de soul y hacer tests
+
+laisser master ipp paris
+demander cesure a ma bourse
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+an example application: the nondifferentiable models used a lot in sparse priors/recovery in inverse problems

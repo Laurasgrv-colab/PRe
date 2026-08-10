@@ -21,7 +21,6 @@ def gradient_proximal_logistic_reg(x, l, f):
     
     return np.matmul((l-s).transpose(), f).transpose()
 
-# À VOIR - extrait de mon code 
 def log_p(th, x, y_l, y_f):
     f_T_x = np.dot(y_f, x)
     log_lik = np.sum(y_l*f_T_x - np.log(1+np.exp(f_T_x)))
@@ -40,6 +39,7 @@ def log_p_laplace(th, x, design_matrix, labels, b=1.0):
     
     return log_lik + log_prior
 
+
 ##############################################################
 ## SOUL ALGORITHM VARIANTS
 ##############################################################
@@ -49,7 +49,7 @@ def soul_mh(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_std, b=
   """
   SOUL where the latent sampling is done via Metropolis-Hastings (MH) instead of ULA.
 
-  Parameters:
+    Parameters:
   - log_p: Function returning log p(th, X, y_l, y_f). Returns a scalar float.
   - th0: Initial parameters
   - x0_M: Initial latent variables from the previous step
@@ -57,10 +57,11 @@ def soul_mh(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_std, b=
   - T: Number of outer optimization steps
   - M: Number of MH steps
   - B: Burn-in steps
-  - D: 
+  - D: Number of dimensions of latent space
   - delta_step: Step size for theta update
   - proposal_std: Standard deviation of the Gaussian random walk proposal (replaces gamma_step)
   - b: Scale parameter of the Laplace prior (default 1.0)
+
   """
   th = np.copy(th0)
   x_t = np.copy(x0_M[:, 0:1]).reshape(D, 1)
@@ -92,17 +93,15 @@ def soul_mh(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_std, b=
     # Compute average gradient with respect to theta over the kept samples
     avg_grad_th = np.zeros_like(th)
     for idx in range(M - B):
-      x_m_burnin = burnin_x_samples[:, idx:idx+1] # Shape (D, 1)
-      # Use the provided theta gradient function
-      avg_grad_th += ((x_m_burnin - th).sum(0) / 5)
+      x_m_burnin = burnin_x_samples[:, idx:idx+1] 
+      avg_grad_th += np.sign(x_m_burnin - th).mean(axis=0) / b # Adapted to Laplace prior
 
-    # Update theta
     th = th + delta_step * (avg_grad_th / (M - B))
     th_list.append(np.copy(th))
 
   return th_list, x_values
 
-# SOUL with Metropolis-Hastings with a decaying learning rate 
+# SOUL with Metropolis-Hastings with a decaying learning rate: gamma
 def soul_mh_decay(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_std, b=1.0, gamma=1):
   """
   SOUL where the latent sampling is done via Metropolis-Hastings (MH) instead of ULA.
@@ -115,10 +114,11 @@ def soul_mh_decay(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_s
   - T: Number of outer optimization steps
   - M: Number of MH steps
   - B: Burn-in steps
-  - D: 
+  - D: Number of dimensions of latent space
   - delta_step: Step size for theta update
   - proposal_std: Standard deviation of the Gaussian random walk proposal (replaces gamma_step)
   - b: Scale parameter of the Laplace prior (default 1.0)
+  - gamma: Decay factor applied per outer step (gamma <= 1); current_delta = delta_step * gamma**t
   """
   th = np.copy(th0)
   x_t = np.copy(x0_M[:, 0:1]).reshape(D, 1)
@@ -130,112 +130,433 @@ def soul_mh_decay(log_p, th0, x0_M, y_l, y_f, T, M, B, D, delta_step, proposal_s
   for t in range(1, T + 1):
     current_delta = delta_step * (gamma**t)
 
-    # Metropolis-Hastings step
     for m in range(1, M + 1):
       z = np.random.normal(0.0, 1.0, x_t.shape)
       x_prop = x_t + proposal_std*z
 
-      # The proposal is symmetri ie. q(x_t | x_prop) = q(x_prop | x_t), so the proposal ratio cancels out.
       log_alpha = min(0, log_p(th, x_prop, y_l, y_f, b) - log_p(th, x_t, y_l, y_f, b))
 
-      # Accept or reject
       if np.log(np.random.uniform(0.0, 1.0)) < log_alpha:
           x_t = x_prop # Accept proposal
-      # else: x_t remains the same
 
-      # Store the current position (accpted or not)
       x_values = np.append(x_values, np.copy(x_t), axis=1)
 
-    burnin_x_samples = x_values[:, -(M-B):] # Shape (D, M-B)
+    burnin_x_samples = x_values[:, -(M-B):] 
 
-    # Compute average gradient with respect to theta over the kept samples
     avg_grad_th = np.zeros_like(th)
     for idx in range(M - B):
-      x_m_burnin = burnin_x_samples[:, idx:idx+1] # Shape (D, 1)
-      # Use the provided theta gradient function
-      avg_grad_th += ((x_m_burnin - th).sum(0) / 5)
+      x_m_burnin = burnin_x_samples[:, idx:idx+1]
+      avg_grad_th += np.sign(x_m_burnin - th).mean(axis=0) / b 
 
-    # Update theta
     th = th + delta_step * (avg_grad_th / (M - B))
     th_list.append(np.copy(th))
 
   return th_list, x_values
 
-#@title SOUL with PAIES algorithm and the stretch move
-def soul_stretch(log_p, th0, x0_N, y_l, y_f, T, M, B, delta_step, a=2.0):
+# SOUL MHSS
+def soul_mh_ss(log_p, th0, x0_M, y_l, y_f, T, M, B, delta_step, proposal_std, lower_bounds, upper_bounds, b=1):
     """
-    Stochastic Optimisation via Affine-Invariant Ensemble SOUL - stretch move.
+    SOUL where the latent sampling is done via Metropolis-Hastings with Standardised Scaling (MH SS).
 
     Parameters:
-    - log_p: Function returning log p(th, X, y_l, y_f). Shape of X is (D, 1).
+    - log_p: Function returning log p(th, X, y_l, y_f). Returns a scalar float.
     - th0: Initial parameters
-    - x0_N: Initial latent variables ensemble (S), shape (D, N) where N is number of walkers
+    - x0_M: Initial latent variables from the previous step
     - y_l, y_f: Observed data
     - T: Number of outer optimization steps
-    - M: Target chain length (number of ensemble update steps)
+    - M: Number of MH steps
     - B: Burn-in steps
     - delta_step: Step size for theta update
-    - a: Stretch move scale parameter (typically 2.0)
+    - proposal_std: Standard deviation of the Gaussian random walk proposal in the [0, 1] space (typically 0.05 to 0.2)
+    - lower_bounds: numpy array of shape (D, 1) containing the lower prior limits for X
+    - upper_bounds: numpy array of shape (D, 1) containing the upper prior limits for X
+    """
+    th = np.copy(th0)
+    D = x0_M.shape[0] # Can be given as a parameter or computed directly inside.
+    x_t = np.copy(x0_M[:, 0:1]).reshape(D, 1)
+
+    bounds_range = upper_bounds - lower_bounds
+
+    x_values = np.array(x0_M)
+    th_list = [np.copy(th)]
+
+    n_accept = 0
+    n_total = 0
+
+    for t in range(1, T + 1):
+
+        for m in range(1, M + 1):
+            # Transform current position to [0, 1] standardised space
+            x_t_std = (x_t - lower_bounds) / bounds_range
+
+            z = np.random.normal(0.0, 1.0, x_t.shape)
+            x_prop_std = x_t_std + proposal_std * z
+
+            # proposals must stay within [0, 1]
+            if np.any(x_prop_std < 0.0) or np.any(x_prop_std > 1.0):
+                # Out of bounds proposal: we reject it and stay at x_t
+                x_values = np.append(x_values, np.copy(x_t), axis=1)
+                continue
+
+            x_prop = x_prop_std * bounds_range + lower_bounds
+
+            # Since the proposal is symmetric in the standardised space and we reject
+            # out-of-bounds proposals, the proposal ratio q(x_t | x_prop) / q(x_prop | x_t) remains 1.
+            log_alpha = min(0, log_p(th, x_prop, y_l, y_f) - log_p(th, x_t, y_l, y_f))
+
+            # Accept or reject
+            if np.log(np.random.uniform(0.0, 1.0)) < log_alpha:
+                x_t = x_prop
+                n_accept += 1
+            n_total+=1
+
+            # Store the current position
+            x_values = np.append(x_values, np.copy(x_t), axis=1)
+
+            burnin_x_samples = x_values[:, -(M - B):]
+
+
+        avg_grad_th = np.zeros_like(th)
+        for idx in range(M - B):
+            x_m_burnin = burnin_x_samples[:, idx:idx + 1]
+            avg_grad_th += np.sign(x_m_burnin - th).mean(axis=0) / b   # mean over D - Laplace score
+
+        th = th + delta_step * (avg_grad_th / (M - B))
+        th_list.append(np.copy(th))
+
+        # Uncomment the following to debug or retune if needed.
+        #if t%13==0:
+            #print("t=", t, "and theta is ", th, "mean(x_t)=", x_t.mean(), "accept rate=", n_accept/n_total)
+
+    return th_list, x_values
+
+# SOUL MHSS with decaying learning rate
+def soul_mh_ss_decay(log_p, th0, x0_M, y_l, y_f, T, M, B, delta_step, proposal_std,
+                      lower_bounds, upper_bounds, b=1, gamma=1):
+    """
+    SOUL where the latent sampling is done via Metropolis-Hastings with Standardised Scaling (MH SS),
+    with a decaying learning rate for the theta update: current_delta = delta_step * gamma**t.
+
+    Parameters:
+    - log_p: Function returning log p(th, X, y_l, y_f). Returns a scalar float.
+    - th0: Initial parameters
+    - x0_M: Initial latent variables from the previous step
+    - y_l, y_f: Observed data
+    - T: Number of outer optimization steps
+    - M: Number of MH steps
+    - B: Burn-in steps
+    - delta_step: Initial step size for theta update
+    - proposal_std: Standard deviation of the Gaussian random walk proposal in the [0, 1] space (typically 0.05 to 0.2)
+    - lower_bounds: numpy array of shape (D, 1) containing the lower prior limits for X
+    - upper_bounds: numpy array of shape (D, 1) containing the upper prior limits for X
+    - b: Scale parameter of the Laplace prior (default 1)
+    - gamma: Decay factor applied per outer step (gamma <= 1); current_delta = delta_step * gamma**t
+    """
+    th = np.copy(th0)
+    D = x0_M.shape[0]
+    x_t = np.copy(x0_M[:, 0:1]).reshape(D, 1)
+
+    bounds_range = upper_bounds - lower_bounds
+
+    x_values = np.array(x0_M)
+    th_list = [np.copy(th)]
+
+    n_accept = 0
+    n_total = 0
+
+    for t in range(1, T + 1):
+        # Decaying learning rate for this outer step
+        current_delta = delta_step * (gamma ** t)
+
+        for m in range(1, M + 1):
+            # Transform current position to [0, 1] standardised space
+            x_t_std = (x_t - lower_bounds) / bounds_range
+
+            z = np.random.normal(0.0, 1.0, x_t.shape)
+            x_prop_std = x_t_std + proposal_std * z
+
+            # proposals must stay within [0, 1]
+            if np.any(x_prop_std < 0.0) or np.any(x_prop_std > 1.0):
+                # Out of bounds proposal: we reject it and stay at x_t
+                x_values = np.append(x_values, np.copy(x_t), axis=1)
+                continue
+
+            x_prop = x_prop_std * bounds_range + lower_bounds
+
+            # Since the proposal is symmetric in the standardised space and we reject
+            # out-of-bounds proposals, the proposal ratio q(x_t | x_prop) / q(x_prop | x_t) remains 1.
+            log_alpha = min(0, log_p(th, x_prop, y_l, y_f) - log_p(th, x_t, y_l, y_f))
+
+            # Accept or reject
+            if np.log(np.random.uniform(0.0, 1.0)) < log_alpha:
+                x_t = x_prop
+                n_accept += 1
+            n_total += 1
+
+            # Store the current position
+            x_values = np.append(x_values, np.copy(x_t), axis=1)
+
+            burnin_x_samples = x_values[:, -(M - B):]
+
+        avg_grad_th = np.zeros_like(th)
+        for idx in range(M - B):
+            x_m_burnin = burnin_x_samples[:, idx:idx + 1]
+            avg_grad_th += np.sign(x_m_burnin - th).mean(axis=0) / b   # mean over D, correct Laplace score
+
+        # Update theta using the decayed step size
+        th = th + current_delta * (avg_grad_th / (M - B))
+        th_list.append(np.copy(th))
+
+        # Uncomment the following to debug or tune parameters if needed
+        #if t % 13 == 0:
+            #print("t=", t, "current_delta=", current_delta, "and theta is ", th, "mean(x_t)=", x_t.mean(), "accept rate=", n_accept / n_total)
+
+    return th_list, x_values
+
+# SOUL with PAIES algorithm and the stretch move - with a decaying learning rate
+def soul_stretch_fast_decay(log_p, th0, x0_N, y_l, y_f, T, M, B, delta_step, a=2.0, b=1, gamma =1):
+    """
+    SOUL where the latent sampling is done via PAIES algorithm and the stretch move,
+    with a decaying learning rate for the theta update: current_delta = delta_step * gamma**t.
+
+    Parameters:
+    - log_p: Function returning log p(th, X, y_l, y_f). Returns a scalar float.
+    - th0: Initial parameters
+    - x0_N: 
+    - y_l, y_f: Observed data
+    - T: Number of outer optimization steps
+    - M: Number of PAIES steps
+    - B: Burn-in steps
+    - delta_step: Initial step size for theta update
+    - a:
+    - b: Scale parameter of the Laplace prior (default 1)
+    - gamma: Decay factor applied per outer step (gamma <= 1); current_delta = delta_step * gamma**t (default 1 - no decaying learning rate)
     """
     th = np.copy(th0)
     D, N = x0_N.shape
     half = N // 2
 
-    # S is our active ensemble of N walkers, shape (D, N)
     S = np.copy(x0_N)
 
-    # Collection C to store all states across the chain length M
-    C = np.expand_dims(np.copy(S), axis=2)
+    # Pre-allocate memory for C to avoid dynamic concatenation overhead
+    total_steps = T * M
+    C = np.zeros((D, N, total_steps + 1))
+    C[:, :, 0] = S
+
     th_list = [th0]
+    global_step = 1
 
     for t in range(1, T + 1):
-        # Affine-Invariant Ensemble steps
+        current_delta = delta_step * (gamma ** t)
         for m in range(1, M + 1):
-            # Randomly shuffle and split S into two halves S1 and S2
             indices = np.random.permutation(N)
             S1_idx, S2_idx = indices[:half], indices[half:]
 
-            # Update each half using the complementary half
             for ens_idx, comp_idx in [(S1_idx, S2_idx), (S2_idx, S1_idx)]:
-                for i in ens_idx:
-                    X_i = S[:, i:i+1] # shape D, 1
+                X_ens = S[:, ens_idx]  # Shape (D, half)
 
-                    # Select a random walker X_j from the complementary ensemble
-                    j = np.random.choice(comp_idx)
-                    X_j = S[:, j:j+1]
+                # Pick random complement walkers for each walker in the active set
+                rand_comp_indices = np.random.choice(comp_idx, size=half)
+                X_comp = S[:, rand_comp_indices]  # Shape (D, half)
 
-                    # Propose new position using the stretch move rule R
-                    u_z = np.random.uniform(0.0, 1.0)
-                    z = (a + (1/a) - 2)*(u_z**2) + 2*u_z*(1-(1/a)) + (1/a)
-                    X_i_new = X_j + z * (X_i - X_j)
+                # Sample z for all active walkers simultaneously
+                u_z = np.random.uniform(0.0, 1.0, size=(1, half))
+                z = (a + (1.0/a) - 2.0)*(u_z**2) + 2.0*u_z*(1.0 - (1.0/a)) + (1.0/a)
 
-                    log_alpha = (D - 1) * np.log(z) + log_p(th, X_i_new, y_l, y_f) - log_p(th, X_i, y_l, y_f)
+                # Vectorized proposal
+                X_new = X_comp + z * (X_ens - X_comp)
 
-                    # Accept or reject
-                    if np.log(np.random.uniform(0.0, 1.0)) < log_alpha:
-                        S[:, i:i+1] = X_i_new
+                # Compute log_p for current and proposed positions across active walkers
+                log_p_cur = np.array([log_p(th, X_ens[:, i:i+1], y_l, y_f) for i in range(half)])
+                log_p_new = np.array([log_p(th, X_new[:, i:i+1], y_l, y_f) for i in range(half)])
 
-            # Save new position (accepted or not)
-            C = np.concatenate((C, np.expand_dims(np.copy(S), axis=2)), axis=2)
+                log_alpha = (D - 1) * np.log(z.reshape(half)) + log_p_new - log_p_cur
 
-        burnin_ensemble_samples = C #[:, :, -(M - B):]  # Shape (D, N, M - B)
-        # no burnin for a test
+                # Vectorized accept/reject step
+                accept_mask = np.log(np.random.uniform(0.0, 1.0, size=half)) < log_alpha
+                X_ens[:, accept_mask] = X_new[:, accept_mask]
 
-        # Reshape to treat all walker positions (post-burnin) as individual particles: shape (D, N * (M - B))
-        flat_samples = burnin_ensemble_samples.reshape(D, -1)
-        num_samples = flat_samples.shape[1]
+                # Update main ensemble state
+                S[:, ens_idx] = X_ens
 
-        # Compute new theta using the averaged gradient
-        avg_grad_th = np.zeros_like(th)
-        for idx in range(num_samples):
-            x_m_burnin = flat_samples[:, idx:idx+1]  # Shape (D, 1)
-            avg_grad_th += ((x_m_burnin - th).sum(0) / 5)
+            # Store current state directly into pre-allocated array
+            C[:, :, global_step] = S
+            global_step += 1
 
-        th = th + delta_step * avg_grad_th / num_samples
+        # Flatten samples for theta update
+        #flat_samples = C[:, :, :global_step].reshape(D, -1)
+        start = (t - 1) * M + 1          # first index of this iteration's block
+        current = C[:, :, start + B : global_step]   # drop B burn-in steps
+        flat_samples = current.reshape(D, -1)
+
+        # Vectorized average theta gradient computation
+        avg_grad_th = np.mean(np.sign(flat_samples - th)) / b
+
+        th = th + current_delta * avg_grad_th
         th_list.append(np.copy(th))
+
+        # Uncomment the following to debug or tune parameters if necessary
+        if t%17==0:
+            print("t=", t, "and theta = ", th)
 
     return th_list, C
 
+
+
+def soul_walk_fast_decay(log_p, th0, x0_N, y_l, y_f, T, M, B, delta_step, b=1.0, gamma = 1):
+    """
+    Stochastic Optimisation via Affine-Invariant Ensemble SOUL - walk move (optimized),
+    with a decaying learning rate for the theta update: current_delta = delta_step * gamma**t.
+
+    Parameters:
+    - log_p: Function returning log p(th, X, y_l, y_f). Returns a scalar float.
+    - th0: Initial parameters
+    - x0_N: 
+    - y_l, y_f: Observed data
+    - T: Number of outer optimization steps
+    - M: Number of inner PAIES steps
+    - B: Burn-in steps
+    - delta_step: Initial step size for theta update
+    - b: Scale parameter of the Laplace prior (default 1)
+    - gamma: Decay factor applied per outer step (gamma <= 1); current_delta = delta_step * gamma**t (default 1 - no decaying learning rate)
+    """
+    th = np.copy(th0)
+    D, N = x0_N.shape
+    half = N // 2
+
+    S = np.copy(x0_N)
+
+    total_steps = T * M
+    C = np.zeros((D, N, total_steps + 1))
+    C[:, :, 0] = S
+
+    th_list = [th0]
+    global_step = 1
+
+    for t in range(1, T + 1):
+        current_delta = delta_step * (gamma ** t)
+        for m in range(1, M + 1):
+            indices = np.random.permutation(N)
+            S1_idx, S2_idx = indices[:half], indices[half:]
+
+            for ens_idx, comp_idx in [(S1_idx, S2_idx), (S2_idx, S1_idx)]:
+                S_comp = S[:, comp_idx]
+                Cov = np.cov(S_comp, ddof=0)
+                if D == 1:
+                    Cov = np.array([[Cov]])
+
+                X_ens = S[:, ens_idx] 
+
+                W = np.random.multivariate_normal(np.zeros(D), Cov, size=half).T
+                X_prop = X_ens + W
+
+                log_p_cur = np.array([log_p(th, X_ens[:, i:i+1], y_l, y_f) for i in range(half)])
+                log_p_prop = np.array([log_p(th, X_prop[:, i:i+1], y_l, y_f) for i in range(half)])
+
+                log_alpha = log_p_prop - log_p_cur
+
+                accept_mask = np.log(np.random.uniform(0.0, 1.0, size=half)) < log_alpha
+                X_ens[:, accept_mask] = X_prop[:, accept_mask]
+
+                S[:, ens_idx] = X_ens
+
+            C[:, :, global_step] = S
+            global_step += 1
+
+        #flat_samples = C[:, :, :global_step].reshape(D, -1)
+        start = (t - 1) * M + 1   
+        current = C[:, :, start + B : global_step]   # Takes ONLY current iteration's samples
+        flat_samples = current.reshape(D, -1)
+
+        #avg_grad_th = np.mean((flat_samples - th).sum(axis=0) / 5)
+        avg_grad_th = np.mean(np.sign(flat_samples - th)) / b
+
+        th = th + current_delta * avg_grad_th
+        th_list.append(np.copy(th))
+
+        if t%17==0:
+            print("t=", t, "and theta = ", th)
+
+    return th_list, C
+
+
+def soul_walk_fast_decay_v2(log_p, th0, x0_N, y_l, y_f, T, M, B, delta_step, b=1.0, gamma=1.0, s=3):
+    """
+    Stochastic Optimisation via Affine-Invariant Ensemble SOUL - Walk Move.
+    Uses s random complement walkers per active walker to construct proposals.
+    """
+    th = np.copy(th0)
+    D, N = x0_N.shape
+    half = N // 2
+
+    S = np.copy(x0_N)
+
+    total_steps = T * M
+    C = np.zeros((D, N, total_steps + 1))
+    C[:, :, 0] = S
+
+    th_list = [th0]
+    global_step = 1
+
+    for t in range(1, T + 1):
+        current_delta = delta_step * (gamma ** t)
+
+        for m in range(1, M + 1):
+            indices = np.random.permutation(N)
+            S1_idx, S2_idx = indices[:half], indices[half:]
+
+            for ens_idx, comp_idx in [(S1_idx, S2_idx), (S2_idx, S1_idx)]:
+                X_ens = S[:, ens_idx]  # Shape (D, half)
+
+                # Pick s random distinct walkers from complement set for EACH active walker
+                # Shape of rand_comp_idx: (half, s)
+                rand_comp_idx = np.array([np.random.choice(comp_idx, size=s, replace=False) for _ in range(half)])
+                
+                # Extract complement samples: shape (D, half, s)
+                X_comp_s = S[:, rand_comp_idx].transpose(0, 1, 2)  
+                
+                # Mean of chosen s walkers for each active walker: shape (D, half, 1)
+                x_bar = np.mean(X_comp_s, axis=2, keepdims=True)
+
+                # Standard normal vector z: shape (s, half)
+                z = np.random.randn(s, half)
+
+                # Vectorized Walk proposal: W = sum_k z_k * (X_k - x_bar)
+                # Shape of (X_comp_s - x_bar): (D, half, s)
+                W = np.einsum('k j, d j k -> d j', z, X_comp_s - x_bar)
+
+                X_prop = X_ens + W
+
+                # Compute log_p for current and proposed positions
+                log_p_cur = np.array([log_p(th, X_ens[:, i:i+1], y_l, y_f) for i in range(half)])
+                log_p_prop = np.array([log_p(th, X_prop[:, i:i+1], y_l, y_f) for i in range(half)])
+
+                log_alpha = log_p_prop - log_p_cur
+
+                # Accept / Reject
+                accept_mask = np.log(np.random.uniform(0.0, 1.0, size=half)) < log_alpha
+                X_ens[:, accept_mask] = X_prop[:, accept_mask]
+
+                S[:, ens_idx] = X_ens
+
+            C[:, :, global_step] = S
+            global_step += 1
+
+        # Slicing current iteration's non-burned-in samples
+        start = (t - 1) * M + 1
+        current = C[:, :, start + B : global_step]
+        flat_samples = current.reshape(D, -1)
+
+        # Average theta gradient computation
+        avg_grad_th = np.mean(np.sign(flat_samples - th)) / b
+
+        th = th + current_delta * avg_grad_th
+        th_list.append(np.copy(th))
+
+        if t % 50 == 0:
+            print(f"t={t}, theta={th}")
+
+    return th_list, C
 
 ##############################################################
 ### MOREAU-YOSIDA LANGEVIN ALGORITHMS AND PROXIMAL MAPS
